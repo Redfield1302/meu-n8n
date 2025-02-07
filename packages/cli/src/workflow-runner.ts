@@ -329,6 +329,7 @@ export class WorkflowRunner {
 	): Promise<void> {
 		const jobData: JobData = {
 			executionId,
+			projectId: data.projectId,
 			loadStaticData: !!loadStaticData,
 			pushRef: data.pushRef,
 		};
