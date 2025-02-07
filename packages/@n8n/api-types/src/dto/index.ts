@@ -45,6 +45,7 @@ export { CredentialsGetManyRequestQuery } from './credentials/credentials-get-ma
 
 export { ImportWorkflowFromUrlDto } from './workflows/import-workflow-from-url.dto';
 export { ManualRunQueryDto } from './workflows/manual-run-query.dto';
+export { TransferWorkflowBodyDto } from './workflows/transfer.dto';
 
 export { CreateOrUpdateTagRequestDto } from './tag/create-or-update-tag-request.dto';
 export { RetrieveTagQueryDto } from './tag/retrieve-tag-query.dto';

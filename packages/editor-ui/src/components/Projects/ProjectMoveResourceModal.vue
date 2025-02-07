@@ -1,6 +1,6 @@
 <script lang="ts" setup>
 import { ref, computed, onMounted, h } from 'vue';
-import type { ICredentialsResponse, IWorkflowDb } from '@/Interface';
+import type { ICredentialsResponse, IUsedCredential, IWorkflowDb } from '@/Interface';
 import { useI18n } from '@/composables/useI18n';
 import { useUIStore } from '@/stores/ui.store';
 import { useProjectsStore } from '@/stores/projects.store';
@@ -10,9 +10,12 @@ import { ResourceType, splitName } from '@/utils/projects.utils';
 import { useTelemetry } from '@/composables/useTelemetry';
 import { ProjectTypes } from '@/types/projects.types';
 import ProjectMoveSuccessToastMessage from '@/components/Projects/ProjectMoveSuccessToastMessage.vue';
+import ProjectMoveResourceModalCredentialsList from '@/components/Projects/ProjectMoveResourceModalCredentialsList.vue';
 import { useToast } from '@/composables/useToast';
 import { getResourcePermissions } from '@/permissions';
 import { sortByProperty } from '@/utils/sortUtils';
+import { useWorkflowsStore } from '@/stores/workflows.store';
+import { useCredentialsStore } from '@/stores/credentials.store';
 
 const props = defineProps<{
 	modalName: string;
@@ -27,10 +30,15 @@ const i18n = useI18n();
 const uiStore = useUIStore();
 const toast = useToast();
 const projectsStore = useProjectsStore();
+const workflowsStore = useWorkflowsStore();
+const credentialsStore = useCredentialsStore();
 const telemetry = useTelemetry();
 
 const filter = ref('');
 const projectId = ref<string | null>(null);
+const shareableCredentials = ref<ICredentialsResponse[]>([]);
+const unShareableCredentials = ref<Array<IUsedCredential | ICredentialsResponse>>([]);
+const shareUsedCredentials = ref(false);
 const processedName = computed(
 	() => processProjectName(props.data.resource.homeProject?.name ?? '') ?? '',
 );
@@ -51,6 +59,7 @@ const selectedProject = computed(() =>
 	availableProjects.value.find((p) => p.id === projectId.value),
 );
 const isResourceInTeamProject = computed(() => isHomeProjectTeam(props.data.resource));
+const isResourceWorkflow = computed(() => props.data.resourceType === ResourceType.Workflow);
 
 const isHomeProjectTeam = (resource: IWorkflowDb | ICredentialsResponse) =>
 	resource.homeProject?.type === ProjectTypes.Team;
@@ -79,6 +88,7 @@ const moveResource = async () => {
 			props.data.resourceType,
 			props.data.resource.id,
 			selectedProject.value.id,
+			shareUsedCredentials.value ? shareableCredentials.value.map((c) => c.id) : undefined,
 		);
 		closeModal();
 		telemetry.track(`User successfully moved ${props.data.resourceType}`, {
@@ -92,10 +102,7 @@ const moveResource = async () => {
 				},
 			}),
 			message: h(ProjectMoveSuccessToastMessage, {
-				routeName:
-					props.data.resourceType === ResourceType.Workflow
-						? VIEWS.PROJECTS_WORKFLOWS
-						: VIEWS.PROJECTS_CREDENTIALS,
+				routeName: isResourceWorkflow.value ? VIEWS.PROJECTS_WORKFLOWS : VIEWS.PROJECTS_CREDENTIALS,
 				resource: props.data.resource,
 				resourceType: props.data.resourceType,
 				resourceTypeLabel: props.data.resourceTypeLabel,
@@ -117,11 +124,39 @@ const moveResource = async () => {
 	}
 };
 
-onMounted(() => {
+onMounted(async () => {
 	telemetry.track(`User clicked to move a ${props.data.resourceType}`, {
 		[`${props.data.resourceType}_id`]: props.data.resource.id,
 		project_from_type: projectsStore.currentProject?.type ?? projectsStore.personalProject?.type,
 	});
+
+	if (isResourceWorkflow.value) {
+		const [workflow, credentials] = await Promise.all([
+			workflowsStore.fetchWorkflow(props.data.resource.id),
+			credentialsStore.fetchAllCredentials(),
+		]);
+
+		shareableCredentials.value = (credentials ?? []).filter(
+			(credential) =>
+				(workflow?.usedCredentials ?? []).find((c) => c.id === credential.id) &&
+				getResourcePermissions(credential.scopes).credential.share,
+		);
+		unShareableCredentials.value = (workflow?.usedCredentials ?? []).reduce(
+			(acc, uc) => {
+				const credential = credentialsStore.getCredentialById(uc.id);
+				const credentialPermissions = getResourcePermissions(credential?.scopes).credential;
+				if (!credentialPermissions.share) {
+					if (credentialPermissions.read) {
+						acc.push(credential);
+					} else {
+						acc.push(uc);
+					}
+				}
+				return acc;
+			},
+			[] as Array<IUsedCredential | ICredentialsResponse>,
+		);
+	}
 });
 </script>
 <template>
@@ -186,8 +221,10 @@ onMounted(() => {
 						>
 						<template #resourceTypeLabel>{{ props.data.resourceTypeLabel }}</template>
 					</i18n-t>
-					<span v-if="props.data.resource.sharedWithProjects?.length ?? 0 > 0">
-						<br />
+					<span
+						v-if="props.data.resource.sharedWithProjects?.length ?? 0 > 0"
+						:class="$style.textBlock"
+					>
 						{{
 							i18n.baseText('projects.move.resource.modal.message.sharingInfo', {
 								adjustToNumber: props.data.resource.sharedWithProjects?.length,
@@ -197,6 +234,50 @@ onMounted(() => {
 							})
 						}}</span
 					>
+					<N8nCheckbox
+						v-if="shareableCredentials.length"
+						v-model="shareUsedCredentials"
+						:class="$style.textBlock"
+						data-test-id="project-move-resource-modal-checkbox-all"
+					>
+						<i18n-t keypath="projects.move.resource.modal.message.usedCredentials">
+							<template #usedCredentials>
+								<N8nTooltip placement="top">
+									<span :class="$style.tooltipText">
+										{{
+											i18n.baseText('projects.move.resource.modal.message.usedCredentials.number', {
+												adjustToNumber: shareableCredentials.length,
+												interpolate: { number: shareableCredentials.length },
+											})
+										}}
+									</span>
+									<template #content>
+										<ProjectMoveResourceModalCredentialsList
+											:current-project-id="projectsStore.currentProjectId"
+											:credentials="shareableCredentials"
+										/>
+									</template>
+								</N8nTooltip>
+							</template>
+						</i18n-t>
+					</N8nCheckbox>
+					<span v-if="unShareableCredentials.length" :class="$style.textBlock">
+						<i18n-t keypath="projects.move.resource.modal.message.unAccessibleCredentials.note">
+							<template #credentials>
+								<N8nTooltip placement="top">
+									<span :class="$style.tooltipText">{{
+										i18n.baseText('projects.move.resource.modal.message.unAccessibleCredentials')
+									}}</span>
+									<template #content>
+										<ProjectMoveResourceModalCredentialsList
+											:current-project-id="projectsStore.currentProjectId"
+											:credentials="unShareableCredentials"
+										/>
+									</template>
+								</N8nTooltip>
+							</template>
+						</i18n-t>
+					</span>
 				</N8nText>
 			</div>
 			<N8nText v-else>{{
@@ -210,7 +291,12 @@ onMounted(() => {
 				<N8nButton type="secondary" text class="mr-2xs" @click="closeModal">
 					{{ i18n.baseText('generic.cancel') }}
 				</N8nButton>
-				<N8nButton :disabled="!projectId" type="primary" @click="moveResource">
+				<N8nButton
+					:disabled="!projectId"
+					type="primary"
+					data-test-id="project-move-resource-modal-button"
+					@click="moveResource"
+				>
 					{{
 						i18n.baseText('projects.move.resource.modal.button', {
 							interpolate: { resourceTypeLabel: props.data.resourceTypeLabel },
@@ -226,5 +312,14 @@ onMounted(() => {
 .buttons {
 	display: flex;
 	justify-content: flex-end;
+}
+
+.textBlock {
+	display: block;
+	margin-top: var(--spacing-s);
+}
+
+.tooltipText {
+	text-decoration: underline;
 }
 </style>
