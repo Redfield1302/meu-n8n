@@ -53,9 +53,14 @@ const props = withDefaults(
 		showFiltersDropdown?: boolean;
 		sortFns?: Record<string, (a: IResource, b: IResource) => number>;
 		sortOptions?: string[];
-		type?: 'datatable' | 'list';
+		type?: 'datatable' | 'list-infinite' | 'list-paginated';
 		typeProps: { itemSize: number } | { columns: DatatableColumn[] };
 		loading: boolean;
+		customPageSize?: number;
+		totalItems?: number;
+		// Set to true if sorting and filtering is done outside of the component
+		dontPerformSortingAndFiltering?: boolean;
+		resourcesRefreshing?: boolean;
 	}>(),
 	{
 		displayName: (resource: IResource) => resource.name || '',
@@ -63,18 +68,24 @@ const props = withDefaults(
 		filters: () => ({ search: '', homeProject: '' }),
 		sortFns: () => ({}),
 		sortOptions: () => ['lastUpdated', 'lastCreated', 'nameAsc', 'nameDesc'],
-		type: 'list',
+		type: 'list-infinite',
 		typeProps: () => ({ itemSize: 80 }),
 		loading: true,
 		additionalFiltersHandler: undefined,
 		showFiltersDropdown: true,
 		shareable: true,
+		customPageSize: 25,
+		totalItems: 0,
+		dontPerformSortingAndFiltering: false,
+		resourcesRefreshing: false,
 	},
 );
 
 const emit = defineEmits<{
 	'update:filters': [value: IFilters];
 	'click:add': [event: Event];
+	'update:current-page': [page: number];
+	'update:page-size': [pageSize: number];
 	sort: [value: string];
 }>();
 
@@ -91,6 +102,7 @@ defineSlots<{
 	}): unknown;
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	default(props: { data: any; updateItemSize: (data: any) => void }): unknown;
+	item(props: { item: unknown; index: number }): unknown;
 }>();
 
 const route = useRoute();
@@ -103,7 +115,7 @@ const sortBy = ref(props.sortOptions[0]);
 const hasFilters = ref(false);
 const filtersModel = ref(props.filters);
 const currentPage = ref(1);
-const rowsPerPage = ref<number>(25);
+const rowsPerPage = ref<number>(props.customPageSize);
 const resettingFilters = ref(false);
 const search = ref<HTMLElement | null>(null);
 
@@ -114,6 +126,9 @@ const filterKeys = computed(() => {
 });
 
 const filteredAndSortedResources = computed(() => {
+	if (props.dontPerformSortingAndFiltering) {
+		return props.resources;
+	}
 	const filtered = props.resources.filter((resource) => {
 		let matches = true;
 
@@ -185,10 +200,12 @@ const hasAppliedFilters = (): boolean => {
 
 const setRowsPerPage = (numberOfRowsPerPage: number) => {
 	rowsPerPage.value = numberOfRowsPerPage;
+	emit('update:page-size', numberOfRowsPerPage);
 };
 
 const setCurrentPage = (page: number) => {
 	currentPage.value = page;
+	emit('update:current-page', page);
 };
 
 defineExpose({
@@ -240,6 +257,7 @@ const resetFilters = () => {
 	});
 
 	resettingFilters.value = true;
+	hasFilters.value = false;
 	sendFiltersTelemetry('reset');
 	emit('update:filters', filtersModel.value);
 };
@@ -270,6 +288,9 @@ const onUpdateFiltersLength = (length: number) => {
 
 const onSearch = (s: string) => {
 	filtersModel.value.search = s;
+	if (s) {
+		hasFilters.value = true;
+	}
 	emit('update:filters', filtersModel.value);
 };
 
@@ -337,6 +358,14 @@ watch(
 	},
 );
 
+watch(
+	() => props.resources,
+	async () => {
+		await nextTick();
+		focusSearchInput();
+	},
+);
+
 onMounted(async () => {
 	await props.initialize();
 	await nextTick();
@@ -358,7 +387,7 @@ onMounted(async () => {
 			<n8n-loading :rows="25" :shrink-last="false" />
 		</div>
 		<template v-else>
-			<div v-if="resources.length === 0">
+			<div v-if="resources.length === 0 && !hasFilters && !resourcesRefreshing">
 				<slot name="empty">
 					<n8n-action-box
 						data-test-id="empty-resources-list"
@@ -446,13 +475,17 @@ onMounted(async () => {
 
 				<slot name="preamble" />
 
+				<div v-if="resourcesRefreshing" class="resource-list-loading">
+					<n8n-loading :rows="10" :shrink-last="false" />
+				</div>
 				<div
-					v-if="filteredAndSortedResources.length > 0"
+					v-else-if="filteredAndSortedResources.length > 0"
 					ref="listWrapperRef"
 					:class="$style.listWrapper"
 				>
+					<!-- INFINITE SCROLLING LIST -->
 					<n8n-recycle-scroller
-						v-if="type === 'list'"
+						v-if="type === 'list-infinite'"
 						data-test-id="resources-list"
 						:items="filteredAndSortedResources"
 						:item-size="itemSize()"
@@ -462,6 +495,29 @@ onMounted(async () => {
 							<slot :data="item" :update-item-size="updateItemSize" />
 						</template>
 					</n8n-recycle-scroller>
+					<!-- PAGINATED LIST -->
+					<div v-else-if="type === 'list-paginated'" :class="$style.paginatedListWrapper">
+						<div :class="$style.listItems">
+							<div v-for="(item, index) in resources" :key="index" :class="$style.listItem">
+								<slot name="item" :item="item" :index="index">
+									{{ item }}
+								</slot>
+							</div>
+						</div>
+						<div :class="$style.listPagination">
+							<el-pagination
+								v-model:current-page="currentPage"
+								v-model:page-size="rowsPerPage"
+								background
+								:total="totalItems"
+								:page-sizes="[10, 25, 50, 100]"
+								layout="total, prev, pager, next, sizes"
+								@update:current-page="setCurrentPage"
+								@size-change="setRowsPerPage"
+							></el-pagination>
+						</div>
+					</div>
+					<!-- DATATABLE -->
 					<n8n-datatable
 						v-if="type === 'datatable'"
 						data-test-id="resources-table"
@@ -528,6 +584,38 @@ onMounted(async () => {
 	position: absolute;
 	height: 100%;
 	width: 100%;
+}
+
+.paginatedListWrapper {
+	display: flex;
+	flex-direction: column;
+	gap: var(--spacing-m);
+	max-height: 100%;
+
+	.listItems {
+		overflow: auto;
+	}
+}
+
+.listPagination {
+	display: flex;
+	justify-content: flex-end;
+	margin-bottom: var(--spacing-l);
+
+	:global(.el-pagination__sizes) {
+		height: 100%;
+		position: relative;
+		top: -1px;
+
+		input {
+			height: 100%;
+			min-height: 28px;
+		}
+
+		:global(.el-input__suffix) {
+			width: var(--spacing-m);
+		}
+	}
 }
 
 .sort-and-filter {

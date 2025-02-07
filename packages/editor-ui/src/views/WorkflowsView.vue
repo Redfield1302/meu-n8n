@@ -11,6 +11,7 @@ import {
 	AI_CREDITS_EXPERIMENT,
 	EnterpriseEditionFeature,
 	VIEWS,
+	DEFAULT_WORKFLOW_PAGE_SIZE,
 } from '@/constants';
 import type { IUser, IWorkflowDb } from '@/Interface';
 import { useUIStore } from '@/stores/ui.store';
@@ -38,6 +39,7 @@ import {
 import { pickBy } from 'lodash-es';
 import ProjectHeader from '@/components/Projects/ProjectHeader.vue';
 import { getEasyAiWorkflowJson } from '@/utils/easyAiWorkflowUtils';
+import { useDebounce } from '@/composables/useDebounce';
 
 const i18n = useI18n();
 const route = useRoute();
@@ -53,6 +55,7 @@ const telemetry = useTelemetry();
 const uiStore = useUIStore();
 const tagsStore = useTagsStore();
 const documentTitle = useDocumentTitle();
+const { callDebounced } = useDebounce();
 
 interface Filters extends IFilters {
 	status: string | boolean;
@@ -65,6 +68,14 @@ const StatusFilter = {
 	ALL: '',
 };
 
+/** Maps sort values from the ResourcesListLayout component to values expected by workflows endpoint */
+const WORKFLOWS_SORT_MAP = {
+	lastUpdated: 'updatedAt:desc',
+	lastCreated: 'createdAt:desc',
+	nameAsc: 'name:asc',
+	nameDesc: 'name:desc',
+} as const;
+
 const loading = ref(false);
 const filters = ref<Filters>({
 	search: '',
@@ -72,13 +83,35 @@ const filters = ref<Filters>({
 	status: StatusFilter.ALL,
 	tags: [],
 });
+
+const workflows = ref<IWorkflowDb[]>([]);
+
 const easyAICalloutVisible = ref(true);
+
+const currentPage = ref(1);
+const pageSize = ref(DEFAULT_WORKFLOW_PAGE_SIZE);
+const currentSort = ref('updatedAt:desc');
 
 const readOnlyEnv = computed(() => sourceControlStore.preferences.branchReadOnly);
 const currentUser = computed(() => usersStore.currentUser ?? ({} as IUser));
-const allWorkflows = computed(() => workflowsStore.allWorkflows as IResource[]);
 const isShareable = computed(
 	() => settingsStore.isEnterpriseFeatureEnabled[EnterpriseEditionFeature.Sharing],
+);
+
+const workflowResources = computed<IResource[]>(() =>
+	// TODO: Add tags
+	workflows.value.map((workflow) => ({
+		id: workflow.id,
+		name: workflow.name,
+		value: '',
+		updatedAt: workflow.updatedAt.toString(),
+		createdAt: workflow.createdAt.toString(),
+		homeProject: workflow.homeProject,
+		scopes: workflow.scopes,
+		type: 'workflow',
+		sharedWithProjects: workflow.sharedWithProjects,
+		readOnly: !getResourcePermissions(workflow.scopes).workflow.update,
+	})),
 );
 
 const statusFilterOptions = computed(() => [
@@ -120,30 +153,27 @@ const emptyListDescription = computed(() => {
 	}
 });
 
-const onFilter = (resource: IResource, newFilters: IFilters, matches: boolean): boolean => {
-	const iFilters = newFilters as Filters;
-	if (settingsStore.areTagsEnabled && iFilters.tags.length > 0) {
-		matches =
-			matches &&
-			iFilters.tags.every((tag) =>
-				(resource as IWorkflowDb).tags?.find((resourceTag) =>
-					typeof resourceTag === 'object'
-						? `${resourceTag.id}` === `${tag}`
-						: `${resourceTag}` === `${tag}`,
-				),
-			);
-	}
-
-	if (newFilters.status !== '') {
-		matches = matches && (resource as IWorkflowDb).active === newFilters.status;
-	}
-
-	return matches;
-};
-
 // Methods
-const onFiltersUpdated = (newFilters: IFilters) => {
+// Watch filters and fetch workflows
+// TODO: Find a better way to do this and avoid fetching workflows twice
+watch(
+	() => filters.value.search,
+	async () => callDebounced(fetchWorkflows, { debounceTime: 500, trailing: true }),
+	{ deep: true },
+);
+
+const onFiltersUpdated = async (newFilters: IFilters) => {
+	// TODO: Find a better way to compare filters
+	if (
+		newFilters.search === filters.value.search &&
+		newFilters.status === filters.value.status &&
+		newFilters.tags === filters.value.tags &&
+		newFilters.homeProject === filters.value.homeProject
+	) {
+		return;
+	}
 	Object.assign(filters.value, newFilters);
+	callDebounced(fetchWorkflows, { debounceTime: 500, trailing: true });
 };
 
 const addWorkflow = () => {
@@ -167,11 +197,47 @@ const trackEmptyCardClick = (option: 'blank' | 'templates' | 'courses') => {
 
 const initialize = async () => {
 	loading.value = true;
-	await Promise.all([
+	const [, workflowsPage] = await Promise.all([
 		usersStore.fetchUsers(),
-		workflowsStore.fetchAllWorkflows(route.params?.projectId as string | undefined),
+		workflowsStore.fetchWorkflowsPage(
+			route.params?.projectId as string | undefined,
+			currentPage.value,
+			pageSize.value,
+			'updatedAt:desc',
+		),
 		workflowsStore.fetchActiveWorkflows(),
 	]);
+	workflows.value = workflowsPage;
+	loading.value = false;
+};
+
+const setCurrentPage = async (page: number) => {
+	currentPage.value = page;
+	await fetchWorkflows();
+};
+
+const setPageSize = async (size: number) => {
+	pageSize.value = size;
+	await fetchWorkflows();
+};
+
+const fetchWorkflows = async () => {
+	// TODO: Check why workflows are fetched twice when navigating projects
+	loading.value = true;
+	const tagNames = filters.value.tags.map((tagId) => tagsStore.tagsById[tagId]?.name);
+	workflows.value = await workflowsStore.fetchWorkflowsPage(
+		((route.params?.projectId as string | undefined) ?? filters.value.homeProject !== '')
+			? filters.value.homeProject
+			: undefined,
+		currentPage.value,
+		pageSize.value,
+		currentSort.value,
+		{
+			name: filters.value.search !== '' ? filters.value.search : undefined,
+			active: filters.value.status !== '' ? Boolean(filters.value.status) : undefined,
+			tags: tagNames.length ? tagNames : undefined,
+		},
+	);
 	loading.value = false;
 };
 
@@ -252,7 +318,7 @@ sourceControlStore.$onAction(({ name, after }) => {
 	after(async () => await initialize());
 });
 
-watch(filters, () => saveFiltersOnQueryString(), { deep: true });
+// watch(filters, () => saveFiltersOnQueryString(), { deep: true });
 
 watch(
 	() => route.params?.projectId,
@@ -261,7 +327,7 @@ watch(
 
 onMounted(async () => {
 	documentTitle.set(i18n.baseText('workflows.heading'));
-	await setFiltersFromQueryString();
+	// await setFiltersFromQueryString();
 	void usersStore.showPersonalizationSurvey();
 });
 
@@ -293,21 +359,34 @@ const openAIWorkflow = async (source: string) => {
 const dismissEasyAICallout = () => {
 	easyAICalloutVisible.value = false;
 };
+
+const onSortUpdated = async (sort: string) => {
+	currentSort.value =
+		WORKFLOWS_SORT_MAP[sort as keyof typeof WORKFLOWS_SORT_MAP] ?? 'updatedAt:desc';
+	await fetchWorkflows();
+};
 </script>
 
 <template>
 	<ResourcesListLayout
 		resource-key="workflows"
-		:resources="allWorkflows"
+		type="list-paginated"
+		:resources="workflows"
 		:filters="filters"
-		:additional-filters-handler="onFilter"
 		:type-props="{ itemSize: 80 }"
 		:shareable="isShareable"
 		:initialize="initialize"
 		:disabled="readOnlyEnv || !projectPermissions.workflow.create"
-		:loading="loading"
+		:loading="false"
+		:resources-refreshing="loading"
+		:custom-page-size="10"
+		:total-items="workflowsStore.totalWorkflowCount"
+		:dont-perform-sorting-and-filtering="true"
 		@click:add="addWorkflow"
 		@update:filters="onFiltersUpdated"
+		@update:current-page="setCurrentPage"
+		@update:page-size="setPageSize"
+		@sort="onSortUpdated"
 	>
 		<template #header>
 			<ProjectHeader />
@@ -341,13 +420,12 @@ const dismissEasyAICallout = () => {
 				</template>
 			</N8nCallout>
 		</template>
-		<template #default="{ data, updateItemSize }">
+		<template #item="{ item: data }">
 			<WorkflowCard
 				data-test-id="resources-list-item"
 				class="mb-2xs"
-				:data="data"
+				:data="data as IWorkflowDb"
 				:read-only="readOnlyEnv"
-				@expand:tags="updateItemSize(data)"
 				@click:tag="onClickTag"
 			/>
 		</template>
