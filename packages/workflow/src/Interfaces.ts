@@ -1617,6 +1617,13 @@ export interface INodeType {
 			[method in WebhookSetupMethodNames]: (this: IHookFunctions) => Promise<boolean>;
 		};
 	};
+	nonRoutingOperations?: {
+		[resource: string]: {
+			[operation: string]: (
+				context: IExecuteFunctions,
+			) => Promise<INodeExecutionData[][] | NodeExecutionWithMetadata[][] | null>;
+		};
+	};
 }
 
 /**
